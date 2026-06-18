@@ -4,9 +4,9 @@ import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
+import requests  # ← NUEVO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import MetaTrader5 as mt5
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -17,13 +17,11 @@ warnings.filterwarnings('ignore')
 
 # ================= CONFIGURACIÓN =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-# ========== CONFIGURACIÓN DE METATRADER 5 (VANTAGE) ==========
-MT5_TERMINAL_PATH = r"C:\Program Files\Vantage International MT5\terminal64.exe"
-SYMBOL = "XAUUSD"
 
-# ========== TEMPORALIDAD ==========
-TIMEFRAME = mt5.TIMEFRAME_M15
-LIMIT = 150
+# ========== CONFIGURACIÓN DE TWELVE DATA ==========
+SYMBOL = "XAU/USD"
+TIMEFRAME = '15min'
+LIMIT = 100
 
 # ========== CONFIGURACIÓN DE SEÑALES ==========
 ENVIO_AUTOMATICO = True
@@ -61,55 +59,36 @@ class TradingSignalRobot:
         self.model = None
         self.scaler = MinMaxScaler()
         self.is_trained = False
-        self.mt5_connected = False
-        self._initialize_mt5()
         
-    def _initialize_mt5(self):
-        try:
-            if not mt5.initialize(MT5_TERMINAL_PATH):
-                if not mt5.initialize():
-                    logger.error("No se pudo inicializar MT5")
-                    return False
-            
-            if not mt5.symbol_select(SYMBOL, True):
-                logger.error(f"Símbolo {SYMBOL} no disponible en MT5")
-                mt5.shutdown()
-                return False
-            
-            self.mt5_connected = True
-            logger.info(f"✅ Conectado a MT5 - Símbolo: {SYMBOL}")
-            logger.info("🧠 IA LSTM + RSI")
-            logger.info("📡 Señales cada: 15 minutos")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error en _initialize_mt5: {e}")
-            return False
-    
     def get_market_data(self):
-        if not self.mt5_connected:
-            logger.error("MT5 no está conectado")
-            return None
-            
+        """Obtiene datos de XAUUSD desde Twelve Data"""
         try:
-            rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, LIMIT)
+            api_key = "e6eb8200194948d69b8f5bd15877f806"
+            url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&outputsize=100&apikey={api_key}"
             
-            if rates is None or len(rates) == 0:
-                logger.error("No se obtuvieron datos de MT5")
+            response = requests.get(url)
+            data = response.json()
+            
+            if 'values' not in data:
+                logger.error(f"Error Twelve Data: {data}")
                 return None
             
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df.set_index('time', inplace=True)
+            df = pd.DataFrame(data['values'])
+            df['open'] = pd.to_numeric(df['open'])
+            df['high'] = pd.to_numeric(df['high'])
+            df['low'] = pd.to_numeric(df['low'])
+            df['close'] = pd.to_numeric(df['close'])
+            df['volume'] = pd.to_numeric(df['volume']) if 'volume' in df else 1000
             
-            df.columns = ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']
-            df = df[['open', 'high', 'low', 'close', 'tick_volume']]
-            df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+            df = df.iloc[::-1]
             
+            logger.info(f"✅ Datos obtenidos: {len(df)} velas")
             return df
             
         except Exception as e:
-            logger.error(f"Error en get_market_data: {e}")
+            logger.error(f"Error en Twelve Data: {e}")
             return None
 
     # ========== RSI ==========
@@ -195,10 +174,10 @@ class TradingSignalRobot:
         
         # Puntuación RSI
         if rsi_actual < 30:
-            rsi_signal = 'BUY'  # Sobreventa → Comprar
+            rsi_signal = 'BUY'
             rsi_score = 85
         elif rsi_actual > 70:
-            rsi_signal = 'SELL'  # Sobrecompra → Vender
+            rsi_signal = 'SELL'
             rsi_score = 85
         elif rsi_actual < 40:
             rsi_signal = 'BUY'
@@ -211,11 +190,9 @@ class TradingSignalRobot:
             rsi_score = 50
         
         # ========== 3. DECISIÓN FINAL ==========
-        # ¿IA y RSI están alineados?
         alineados = (ia_signal == rsi_signal) and ia_signal != 'NEUTRAL'
         
         if alineados:
-            # Si están alineados, la señal es fuerte
             if ia_signal == 'BUY':
                 final_signal = 'BUY'
                 confidence = 85
@@ -226,8 +203,6 @@ class TradingSignalRobot:
                 final_signal = 'NEUTRAL'
                 confidence = 0
         else:
-            # Si no están alineados, ponderamos
-            # 50% IA + 50% RSI
             weighted_score = (ia_score * 0.50 + rsi_score * 0.50)
             
             if weighted_score >= 65:
@@ -284,13 +259,6 @@ class TradingSignalRobot:
             'alineados': alineados,
             'atr': atr_val
         }
-    
-    def __del__(self):
-        try:
-            if self.mt5_connected:
-                mt5.shutdown()
-        except:
-            pass
 
 # ================= BOT DE TELEGRAM =================
 class TelegramBot:
@@ -339,7 +307,6 @@ class TelegramBot:
             return
         
         dias_restantes = self.obtener_tiempo_restante(user_id)
-        mt5_status = "✅ Conectado" if self.robot.mt5_connected else "❌ Desconectado"
         
         mensaje = (
             "🤖 *ROBOT XAUUSD - IA + RSI*\n\n"
@@ -349,9 +316,9 @@ class TelegramBot:
             "📊 *LÓGICA:*\n"
             "• IA y RSI alineados → SEÑAL FUERTE\n"
             "• Desalineados → Ponderación 50/50\n\n"
-            f"📊 *Símbolo:* {SYMBOL}\n"
-            f"⏱️ *Timeframe:* M15\n"
-            f"📡 *MT5:* {mt5_status}\n"
+            f"📊 *Símbolo:* XAU/USD\n"
+            f"⏱️ *Timeframe:* 15min\n"
+            f"🔄 *Fuente:* Twelve Data\n"
             f"⏰ *Días:* {dias_restantes:.1f}\n\n"
             "📱 /signal - Señal manual\n"
             "📱 /stop - Detener señales"
@@ -359,7 +326,7 @@ class TelegramBot:
         
         await update.message.reply_text(mensaje, parse_mode='Markdown')
         
-        if ENVIO_AUTOMATICO and not self.processing and self.robot.mt5_connected:
+        if ENVIO_AUTOMATICO and not self.processing:
             self.processing = True
             asyncio.create_task(self.enviar_senales_automaticas())
     
@@ -496,7 +463,7 @@ class TelegramBot:
 
 ⏰ *Próxima:* {INTERVALO_MINUTOS} min
 ━━━━━━━━━━━━━━━━━━━━━━━
-🧠 IA LSTM + RSI
+🧠 IA LSTM + RSI | Twelve Data
 """
         
         keyboard = [[InlineKeyboardButton("📊 Señal Manual", callback_data='manual_signal')]]
@@ -523,12 +490,12 @@ class TelegramBot:
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
         print("=" * 60)
-        print("🤖 ROBOT XAUUSD - IA + RSI")
+        print("🤖 ROBOT XAUUSD - IA + RSI (Twelve Data)")
         print("=" * 60)
-        print(f"📊 Símbolo: {SYMBOL}")
-        print(f"⏱️ Timeframe: M15")
+        print(f"📊 Símbolo: XAU/USD")
+        print(f"⏱️ Timeframe: 15min")
         print(f"📡 Señales: {INTERVALO_MINUTOS} min")
-        print(f"📡 MT5: {'✅' if self.robot.mt5_connected else '❌'}")
+        print(f"🔄 Fuente: Twelve Data")
         print("-" * 60)
         print("🧠 FACTORES:")
         print("   • IA LSTM (Predicción)")
