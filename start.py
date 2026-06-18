@@ -2,11 +2,14 @@ from robot import TelegramBot
 import os
 
 if __name__ == "__main__":
+    print("✅ Iniciando Robot XAUUSD...")
+    
     # Verificar que el token existe
-    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
         print("❌ ERROR: TELEGRAM_BOT_TOKEN no está configurado")
         exit(1)
     
-    print("✅ Iniciando Robot XAUUSD...")
+    print("✅ Token encontrado")
     bot = TelegramBot()
     bot.run()
